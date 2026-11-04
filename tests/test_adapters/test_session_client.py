@@ -51,7 +51,7 @@ async def _running_session_client(response_for_path, *, extra_body=None):
         status, headers, body = response_for_path(request.path)
         return web.Response(status=status, headers=headers, body=body)
 
-    upstream_app = web.Application()
+    upstream_app = web.Application(client_max_size=16 * 1024**2)
     upstream_app.router.add_route('*', '/{path:.*}', upstream_handler)
     upstream = TestServer(upstream_app)
     await upstream.start_server()
@@ -68,6 +68,40 @@ async def _running_session_client(response_for_path, *, extra_body=None):
     finally:
         await proxy.stop()
         await upstream.close()
+
+
+@pytest.mark.asyncio
+async def test_record_keeps_xtuner_request_identity():
+    def response_for_path(_path):
+        return 200, {'Content-Type': 'application/json'}, json.dumps({
+            'id': 'xtuner-turn-7',
+            'choices': [{'message': {'role': 'assistant', 'content': 'ok'}, 'finish_reason': 'stop'}]
+        }).encode()
+    async with _running_session_client(response_for_path) as (proxy, calls):
+        async with aiohttp.ClientSession() as client:
+            async with client.post(f'{proxy.url}/v1/chat/completions', json={
+                'model': 'test', 'messages': [{'role': 'user', 'content': 'hello'}]
+            }) as response:
+                assert response.status == 200
+        assert proxy.get_messages()[0]['request_id'] == 'turn-7'
+
+
+@pytest.mark.asyncio
+async def test_large_context_request_passes_local_proxy():
+    def response_for_path(_path):
+        return 200, {'Content-Type': 'application/json'}, json.dumps({
+            'id': 'xtuner-large',
+            'choices': [{'message': {'role': 'assistant', 'content': 'ok'}, 'finish_reason': 'stop'}]
+        }).encode()
+    async with _running_session_client(response_for_path) as (proxy, calls):
+        text = 'x' * (1024**2 + 32)
+        async with aiohttp.ClientSession() as client:
+            async with client.post(f'{proxy.url}/v1/chat/completions', json={
+                'model': 'test', 'messages': [{'role': 'user', 'content': text}]
+            }) as response:
+                assert response.status == 200
+        assert json.loads(calls[0]['body'])['messages'][0]['content'] == text
+        assert proxy.get_messages()[0]['request_id'] == 'large'
 
 
 @pytest.mark.asyncio

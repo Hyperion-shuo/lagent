@@ -376,7 +376,8 @@ class SessionClient:
         """Start the proxy HTTP server."""
         if self.is_running:
             return
-        self._app = web.Application()
+        # Long agentic contexts routinely exceed aiohttp's default 1 MiB.
+        self._app = web.Application(client_max_size=16 * 1024**2)
         # Catch-all route to proxy any path
         self._app.router.add_route('*', '/{path:.*}', self._handle_request)
         self._runner = web.AppRunner(self._app)
@@ -588,7 +589,13 @@ class SessionClient:
                 return response
 
             messages, tools = built
-            self._records[self.session_id].append({'messages': messages, 'tools': tools})
+            record = {'messages': messages, 'tools': tools}
+            response_id = response_data.get('id', '')
+            request_id = (response_id.removeprefix('xtuner-') if response_id.startswith('xtuner-')
+                          else response.headers.get('X-XTuner-Request-ID'))
+            if request_id:
+                record['request_id'] = request_id
+            self._records[self.session_id].append(record)
             logger.debug(
                 f"Updated messages for session {self.session_id}: {len(self._records[self.session_id])} traces total"
             )

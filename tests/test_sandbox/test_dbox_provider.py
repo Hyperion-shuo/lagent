@@ -307,6 +307,21 @@ class DBoxProviderTests(unittest.IsolatedAsyncioTestCase):
             await provider.create(image_tag="task:main")
         self.assertNotIn(self.secret, "".join(traceback.format_exception(caught.exception)))
 
+    async def test_429_classifies_without_exposing_message_or_retrying_create(self):
+        for code in ("QUOTA_EXCEEDED", "RATE_LIMITED", self.secret):
+            with self.subTest(code=code):
+                provider = await self.provider(lambda request: httpx.Response(
+                    429, json={"error": {"code": code, "message": self.secret}}))
+                before = len(self.requests)
+                with self.assertRaisesRegex(RuntimeError, "HTTP 429") as caught:
+                    await provider.create(image_tag="task:main")
+                rendered = "".join(traceback.format_exception(caught.exception))
+                self.assertNotIn(self.secret, rendered)
+                if code != self.secret:
+                    self.assertIn(code, rendered)
+                self.assertEqual(len(self.requests), before + 1)
+                self.assertFalse(provider.owned_env_ids)
+
     async def test_malformed_response_does_not_expose_body(self):
         provider = await self.provider(lambda request: httpx.Response(202, text=self.secret))
         with self.assertRaisesRegex(RuntimeError, "invalid JSON") as caught:

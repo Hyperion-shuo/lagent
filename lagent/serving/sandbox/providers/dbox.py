@@ -123,7 +123,16 @@ class DBoxProvider:
         # Do not expose response bodies, request headers, or an exception chain
         # from the upstream service; errors may echo IAM credentials.
         if response.status_code >= 300 and response.status_code != 404:
-            raise RuntimeError(f"DBox {method} request returned HTTP {response.status_code}")
+            classification = ""
+            if response.status_code == 429:
+                try:
+                    error = response.json().get("error", {})
+                    code = error.get("code") if isinstance(error, dict) else None
+                    if code in {"RATE_LIMITED", "QUOTA_EXCEEDED"}:
+                        classification = f" ({code})"
+                except (ValueError, AttributeError):
+                    pass
+            raise RuntimeError(f"DBox {method} request returned HTTP {response.status_code}{classification}")
         return response
 
     @staticmethod
