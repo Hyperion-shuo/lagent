@@ -31,6 +31,7 @@ Usage::
 
 import copy
 import json
+import math
 import os
 import re
 import uuid
@@ -318,6 +319,9 @@ class SessionClient:
         real_api_key: The actual API key to use when forwarding requests.
         real_base_url: The actual LLM API base URL to forward to.
         port: Port to listen on. 0 means auto-assign.
+        request_timeout: Optional positive upstream request deadline in seconds.
+            None preserves aiohttp's existing default (300 seconds). The
+            connection establishment deadline remains 30 seconds when set.
     """
 
     def __init__(
@@ -328,11 +332,20 @@ class SessionClient:
         session_id: Optional[str] = None,
         extra_body: Optional[dict] = None,
         http_proxy: Optional[str] = None,
+        request_timeout: Optional[float] = None,
     ):
+        if request_timeout is not None and (
+            isinstance(request_timeout, bool)
+            or not isinstance(request_timeout, (int, float))
+            or not math.isfinite(request_timeout)
+            or request_timeout <= 0
+        ):
+            raise ValueError('request_timeout must be a finite positive number of seconds or None')
         self.real_api_key = real_api_key
         self.real_base_url = real_base_url.rstrip('/')
         self.port = port
         self.http_proxy = http_proxy
+        self.request_timeout = request_timeout
         self.session_id = session_id or ctx_session_id.get() or os.getenv('XTUNER_SESSION_ID') or str(uuid.uuid4().int)
         self.extra_body = extra_body or {}
         self._records: Dict[str, List[Dict[str, list]]] = defaultdict(list)
@@ -465,7 +478,10 @@ class SessionClient:
 
         is_stream = provider_request_data.get('stream', False) if provider_request_data else False
 
-        async with aiohttp.ClientSession() as client:
+        session_kwargs = {}
+        if self.request_timeout is not None:
+            session_kwargs['timeout'] = aiohttp.ClientTimeout(total=self.request_timeout, sock_connect=30)
+        async with aiohttp.ClientSession(**session_kwargs) as client:
             async with client.request(
                 method=request.method,
                 url=target_url,
