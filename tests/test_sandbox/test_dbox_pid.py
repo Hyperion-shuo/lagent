@@ -24,8 +24,7 @@ class PIDTests(unittest.IsolatedAsyncioTestCase):
             command = json.loads(req.content)['command']
             self.assertNotIn('18000', command)
             self.assertNotIn('private', command)
-            code = shlex.split(command)[2]
-            result = subprocess.run(['python3', '-c', code], capture_output=True, text=True, check=True)
+            result = subprocess.run(['bash', '-c', command], capture_output=True, text=True, check=True)
             events = [{'type': 'stdout', 'text': result.stdout}, {'type': 'execution_complete', 'exit_code': 0}]
             return httpx.Response(200, text='\n'.join('data: '+json.dumps(e) for e in events))
         c = await self.client(handler)
@@ -59,7 +58,7 @@ class PIDTests(unittest.IsolatedAsyncioTestCase):
         class Stream(httpx.AsyncByteStream):
             closed = False
             async def __aiter__(self):
-                yield b'data: {"type":"stdout","text":"DBOX_PID:1"}\n'
+                yield b'data: {"type":"stdout","text":"DBOX_PID:0"}\n'
                 yield b'data: {"type":"execution_complete"}\n'
                 await asyncio.sleep(60)
             async def aclose(self): self.closed = True

@@ -141,7 +141,7 @@ class GatewayProvider:
             url = info.get("url")
             if not url:
                 raise RuntimeError("Gateway has no remote-exec URL")
-            client = SandboxClient(url)
+            client = SandboxClient(url, sandbox_id=env_id, lifecycle_provider=self)
         except BaseException:
             # An allocated but failed sandbox never becomes a Pool lease.
             # Keep its ID if rollback fails; the owning pool retries cleanup.
@@ -231,6 +231,8 @@ class GatewayProvider:
         """
         try:
             resp = await self._client.get(f"/envs/{env_id}", timeout=self._get_timeout)
+            if resp.status_code == 404:
+                return {"ok": True, "env": {"env_id": env_id, "status": "deleted"}}
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:
