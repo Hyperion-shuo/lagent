@@ -349,6 +349,7 @@ class SessionClient:
         self.session_id = session_id or ctx_session_id.get() or os.getenv('XTUNER_SESSION_ID') or str(uuid.uuid4().int)
         self.extra_body = extra_body or {}
         self._records: Dict[str, List[Dict[str, list]]] = defaultdict(list)
+        self._turn_route_pruning = False
         self._app: Optional[web.Application] = None
         self._runner: Optional[web.AppRunner] = None
         self._site: Optional[web.TCPSite] = None
@@ -419,6 +420,10 @@ class SessionClient:
         if is_generation and isinstance(request_data, dict):
             request_data.update(self.extra_body)
             request_data['session_id'] = self.session_id
+            # Advertised by the turn server only; synchronous backends see no new field.
+            request_data.pop('xtuner_route_ack', None)
+            if self._turn_route_pruning:
+                request_data['xtuner_route_ack'] = self._route_ack()
             if is_anthropic:
                 request_data['provider'] = 'anthropic'
                 # Drop SDK-injected beta flags the upstream (e.g. Bedrock) rejects;
@@ -588,6 +593,8 @@ class SessionClient:
             if built is None:
                 return response
 
+            if response_data.get('xtuner_route_pruning') is True:
+                self._turn_route_pruning = True
             messages, tools = built
             record = {'messages': messages, 'tools': tools}
             response_id = response_data.get('id', '')
@@ -1131,6 +1138,18 @@ class SessionClient:
                 filtered.append(rec_i)
 
         return filtered
+
+    def _route_ack(self):
+        """Acknowledge only received records, using the exact export selection rule.
+
+        Records are append-only: an endpoint removed by prefix dedup cannot
+        become selected again when another record is appended.
+        """
+        records = self._records.get(self.session_id, [])
+        if not records or any(not record.get('request_id') for record in records):
+            return None
+        return {'observed': [record['request_id'] for record in records],
+                'retained': [record['request_id'] for record in self.get_messages()]}
 
     def release_trace(self):
         """Clear recorded data for this session."""
