@@ -11,6 +11,7 @@ import asyncio
 import base64
 import json
 import shlex
+import time
 
 import httpx
 
@@ -30,6 +31,7 @@ class DBoxSandboxClient(SandboxClient):
         self._execd_token = execd_token
         self.sandbox_id = sandbox_id
         self.provider = provider
+        self.pid_check_diagnostics: list[dict] = []
 
     async def _remote_request(self, path: str, payload: dict | None = None, timeout: float = 60) -> dict:
         encoded = base64.b64encode(json.dumps(payload).encode()).decode() if payload is not None else ""
@@ -53,8 +55,12 @@ class DBoxSandboxClient(SandboxClient):
         except Exception:
             raise RuntimeError("DBox execution returned invalid response data") from None
 
-    async def _execd_stdout(self, command: str, timeout: float) -> str:
+    async def _execd_stdout(self, command: str, timeout: float, *, diagnostic: dict | None = None) -> str:
         """Read a completed execd stream without exposing commands or credentials."""
+        started = time.monotonic()
+        def mark(stage):
+            if diagnostic is not None:
+                diagnostic[stage + "_seconds"] = round(time.monotonic() - started, 6)
         headers = self._auth_headers()
         headers["X-EXECD-ACCESS-TOKEN"] = self._execd_token
         stdout = []
@@ -65,6 +71,9 @@ class DBoxSandboxClient(SandboxClient):
                 "POST", "command", headers=headers,
                 json={"command": command}, timeout=timeout,
             ) as response:
+                mark("headers")
+                if diagnostic is not None:
+                    diagnostic["http_status"] = response.status_code
                 if response.status_code != 200:
                     raise DBoxTransportError(f"DBox execd returned HTTP {response.status_code}")
                 async for line in response.aiter_lines():
@@ -78,7 +87,16 @@ class DBoxSandboxClient(SandboxClient):
                         continue
                     if not isinstance(event, dict):
                         raise DBoxTransportError("Invalid execd event")
+                    if diagnostic is not None:
+                        if "first_event_seconds" not in diagnostic:
+                            mark("first_event")
+                        diagnostic["last_event_type"] = (event.get("type") if event.get("type") in {
+                            "init", "ping", "stdout", "stderr", "error", "execution_error", "execution_complete"
+                        } else "unknown")
+                        mark("last_event")
                     if event.get("type") == "stdout":
+                        if diagnostic is not None and "first_stdout_seconds" not in diagnostic:
+                            mark("first_stdout")
                         stdout.append(event.get("text", ""))
                     elif event.get("type") in {"stderr", "error", "execution_error"}:
                         failed = True
@@ -86,6 +104,8 @@ class DBoxSandboxClient(SandboxClient):
                         if event.get("exit_code", 0) != 0:
                             failed = True
                         complete = True
+                        mark("execution_complete")
+                        break  # Terminal protocol event; do not wait for HTTP EOF.
         except DBoxTransportError:
             raise
         except Exception as exc:
@@ -110,14 +130,25 @@ class DBoxSandboxClient(SandboxClient):
             "else:\n"
             " print('DBOX_PID:1')\n"
         )
+        diagnostic = {"pid": pid, "started_at": time.time()}
+        started = time.monotonic()
         try:
-            async with asyncio.timeout(30):
-                text = await self._execd_stdout("python3 -c " + shlex.quote(code), 30)
-        except TimeoutError:
-            raise DBoxTransportError("DBox PID check deadline exceeded") from None
-        if text not in {"DBOX_PID:0", "DBOX_PID:1"}:
-            raise DBoxTransportError("Invalid DBox PID check result")
-        return text == "DBOX_PID:1"
+            try:
+                async with asyncio.timeout(30):
+                    text = await self._execd_stdout("python3 -c " + shlex.quote(code), 30, diagnostic=diagnostic)
+            except TimeoutError:
+                raise DBoxTransportError("DBox PID check deadline exceeded") from None
+            if text not in {"DBOX_PID:0", "DBOX_PID:1"}:
+                raise DBoxTransportError("Invalid DBox PID check result")
+            diagnostic.update(ok=True, running=text == "DBOX_PID:1")
+            return text == "DBOX_PID:1"
+        except BaseException as exc:
+            diagnostic.update(ok=False, error_type=type(exc).__name__)
+            raise
+        finally:
+            diagnostic["elapsed_seconds"] = round(time.monotonic() - started, 6)
+            self.pid_check_diagnostics.append(diagnostic)
+            del self.pid_check_diagnostics[:-3]
 
     async def execute(self, command: str, cwd: str = "/root", timeout_sec: int = 60, detach: bool = False) -> dict:
         return await self._remote_request(
