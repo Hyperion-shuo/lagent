@@ -1,9 +1,9 @@
 """Monitoring must distinguish process exit from transport and lifecycle failure."""
+import asyncio
 import base64
 import json
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import time
 import unittest
@@ -104,18 +104,44 @@ class ProcessTransportTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_malformed_probe_result_is_never_interpreted_as_process_exit(self):
         client=await self.client(lambda r:httpx.Response(200))
-        client.execute=AsyncMock(return_value={'return_code':None})
-        with self.assertRaisesRegex(DBoxTransportError,'valid process state'):
-            await client.is_pid_running(123)
+        for text in ('', 'DBOX_PID:', 'DBOX_PID:2', 'DBOX_PID:137', 'unexpected'):
+            with self.subTest(text=text):
+                client._execd_stdout=AsyncMock(return_value=text)
+                with self.assertRaisesRegex(DBoxTransportError,'valid process state'):
+                    await client.is_pid_running(123)
 
     async def test_live_and_exited_probe_result_and_no_kill_zero_zombie_test(self):
         client=await self.client(lambda r:httpx.Response(200))
-        client.execute=AsyncMock(side_effect=[{'return_code':0},{'return_code':1}])
+        client._execd_stdout=AsyncMock(side_effect=['DBOX_PID:0','DBOX_PID:1'])
         self.assertTrue(await client.is_pid_running(123))
         self.assertFalse(await client.is_pid_running(123))
-        command=client.execute.call_args.args[0]
+        command=client._execd_stdout.call_args.args[0]
         self.assertIn('/proc/123/stat',command)
         self.assertNotIn('kill -0',command)
+
+    async def test_process_probe_bypasses_the_remote_exec_queue(self):
+        # The probe is one execd command; it never goes through remote-exec,
+        # which also runs the agent's tool commands.
+        requests=[]
+        def handler(request):
+            requests.append(json.loads(request.content)['command'])
+            return httpx.Response(200,text=json.dumps({'type':'stdout','text':'DBOX_PID:0'})+'\n'
+                                  +json.dumps({'type':'execution_complete'})+'\n')
+        client=await self.client(handler)
+        client.execute=AsyncMock(side_effect=AssertionError('remote-exec used'))
+        self.assertTrue(await client.is_pid_running(123))
+        self.assertEqual(len(requests),1)
+        self.assertIn('/proc/123/stat',requests[0])
+        self.assertNotIn('127.0.0.1:18000',requests[0])
+
+    async def test_stalled_process_probe_is_a_bounded_transport_error(self):
+        client=await self.client(lambda r:httpx.Response(200))
+        async def stalled(*args, **kwargs): await asyncio.sleep(1)
+        client._execd_stdout=stalled
+        client.process_probe_deadline_sec=.01
+        with self.assertRaises(DBoxTransportError) as error:
+            await client.is_pid_running(123)
+        self.assertEqual((error.exception.phase,error.exception.transport_error_type),('process_probe','TimeoutError'))
 
     async def test_mutating_commands_are_never_replayed_after_transport_failure(self):
         calls=[]
@@ -129,10 +155,11 @@ class ProcessTransportTests(unittest.IsolatedAsyncioTestCase):
     @unittest.skipUnless(hasattr(os,'fork') and Path('/proc').exists(),'requires Linux procfs')
     async def test_real_zombie_is_exited_even_though_kill_zero_succeeds(self):
         client=await self.client(lambda r:httpx.Response(200))
-        async def execute(command,**kwargs):
-            result=subprocess.run(shlex.split(command),capture_output=True,timeout=5)
-            return {'return_code':result.returncode}
-        client.execute=execute
+        async def execd_stdout(command,timeout, **kwargs):
+            # The real execd runs the command through a shell.
+            result=subprocess.run(['/bin/sh','-c',command],capture_output=True,text=True,timeout=5)
+            return result.stdout.strip()
+        client._execd_stdout=execd_stdout
         pid=os.fork()
         if pid==0: os._exit(0)
         try:

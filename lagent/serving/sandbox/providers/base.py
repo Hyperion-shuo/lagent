@@ -181,6 +181,14 @@ class SandboxClient:
         pid = int(pid)
         if pid <= 0:
             raise ValueError("A positive process ID is required")
+        rc = await self._run_process_probe(self._process_probe_command(pid))
+        if type(rc) is not int or rc not in {0, 1}:
+            raise self._process_probe_error()
+        return rc == 0
+
+    @staticmethod
+    def _process_probe_command(pid: int) -> str:
+        # Exit 0: running; 1: exited, reaped or zombie; 2: unknown state.
         code = (
             "from pathlib import Path; import sys\n"
             "try: state=Path('/proc/" + str(pid) + "/stat').read_text().rsplit(')',1)[1].split()[0]\n"
@@ -188,11 +196,11 @@ class SandboxClient:
             "except (OSError,IndexError,UnicodeError): sys.exit(2)\n"
             "sys.exit(1 if state in {'Z','X'} else 0 if state in {'R','S','D','T','t','I','P','W'} else 2)"
         )
-        result = await self.execute("python3 -c " + shlex.quote(code), cwd="/tmp", timeout_sec=5)
-        rc = result.get("return_code")
-        if type(rc) is not int or rc not in {0, 1}:
-            raise self._process_probe_error()
-        return rc == 0
+        return "python3 -c " + shlex.quote(code)
+
+    async def _run_process_probe(self, command: str) -> int | None:
+        result = await self.execute(command, cwd="/tmp", timeout_sec=5)
+        return result.get("return_code")
 
     def _process_probe_error(self) -> Exception:
         return SandboxProcessError("Sandbox process probe returned no valid process state")
